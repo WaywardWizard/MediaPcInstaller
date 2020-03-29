@@ -1,0 +1,4 @@
+.project
+.pydevproject
+*.gz
+__pycache__
