@@ -1,430 +1,354 @@
 from collections import defaultdict as dd
 import re
+import ast
 import tempfile
-import json
-import pathlib
+from pathlib import Path
 from util import bash,getDictionaryFromKeyValueString,userConfirm
+
+"""
+@TODO:
+Get fstype to reflect in partition data (no fs, no relection)
+Make fs before attempting to mount
+"""
+
+
+class PartitionTable:
+    def __init__(self, disk):
+        self.disk=disk
+
+        self.partitiondata={}
+        self._data={}
+        self._updatePartitionTableData()
+        
+        self.uuid=self._data['blkid']['PTUUID']
+        self.type=self._data['blkid']['PTTYPE']
+
+        
+    def __str__(self):
+        s=f"{self.type} partition table on {self.disk.device}\n"
+        for p in self._partitions:
+            s+=str(p)
+        return(s)
+
+    def _updatePartitionTableData(self):
+        """Use sfdisk, parted and blkid to read partition table information from disk"""
+        if self.disk is None:
+            raise ValueError("Disk must be set to read partition table")
+
+        self._data['sfdisk']=\
+            ast.literal_eval(bash(f'sudo sfdisk -l -J {self.disk.device}').stdout)
+        self._data['parted']=\
+            list(map(
+                lambda x:x.rstrip(';').split(':'),
+                    filter(
+                        lambda x:re.match('[0-9]',x) is not None,
+                        bash(f'sudo parted -m {self.disk.device} unit s print')
+                            .stdout
+                            .splitlines()
+                        )
+                    ))
+        self._data['blkid']=getDictionaryFromKeyValueString(\
+            bash(f'sudo blkid -o export {self.disk.device}').stdout)
+
+        self.firstlba=self._data['sfdisk']['partitiontable']['firstlba']
+        self.lastlba=self._data['sfdisk']['partitiontable']['lastlba']
+        self.bytessector=self._data['sfdisk']['partitiontable']['sectorsize']
+
+        def _collatePartitionData(sfdiskData):
+
+            device = Path(sfdiskData['node'])
+            blkidData=getDictionaryFromKeyValueString(\
+                bash(f'sudo blkid -o export {device}').stdout)
+
+            start = int(sfdiskData['start'])
+
+            partedData = list(filter(lambda x: int(x[1].rstrip('s'))==start, self._data['parted'])).pop()
+            data={
+                'device':device,
+                'startsector':start,
+                'endsector':int(partedData[2].rstrip('s')),
+                'sectorcount':int(sfdiskData['size']),
+                'fstype':partedData[4],
+                'fslabel':blkidData['LABEL'],
+                'fsuuid':blkidData['UUID'],
+                'partlabel':sfdiskData['name'],
+                'partuuid':sfdiskData['uuid'],
+                'partflag':partedData[6],
+                'partnbr':int(partedData[0])
+            }
+            self.partitiondata[device]=data                 #By device
+            self.partitiondata[sfdiskData['name']]=data
+            self.partitiondata[sfdiskData['uuid']]=data     #By uuid
+            self.partitiondata[blkidData['UUID']]=data     #By fsuuid
+            
+        if 'partitions' in self._data['sfdisk']['partitiontable']:
+            [_collatePartitionData(d) for d in self._data['sfdisk']['partitiontable']['partitions']]
+
+        self._updatePartitions()
+
+    def _updatePartitions(self):
+        """Update partition objects to match what is in the table currently"""
+        self._partitions=set([Partition(self,Path(x)) for x in self._listDevices()])
+
+    def _listDevices(self):
+        if not 'partitions' in self._data['sfdisk']['partitiontable']:
+            return([])
+        return([n['node'] for n in self._data['sfdisk']['partitiontable']['partitions']])
+
+    def _getNextFreeSectorBlock(self, after=None):
+        """Returns the next free contiguous set of usable adresses [start,end]
+        
+        :param after: Find chunk starting on this sector or after
+        :return:(None,None) if not found, else (start, end)
+        """
+
+        if(after is None):after=self.firstlba
+        after=self.disk.alignStartSector(after)
+
+        end=set()
+        [end.add(x.endsector) for x in self._partitions]
+        
+        # Ending at beginning of disk for initial partition
+        # Only want aligned start sectors orthis algo wont work
+        end.add(self.disk.alignStartSector(self.firstlba)-1)
+
+        orderedEnd=list(end)
+        orderedEnd.sort()
+        
+        start=set()
+        [start.add(x.startsector) for x in self._partitions]
+        orderedStart=list(start)
+        orderedStart.sort()
+        
+        def _findNextStart(onOrAfter):
+            if(len(start)==0):
+                return(self.lastlba)
+
+            for s in orderedStart:
+                if s>=onOrAfter:
+                    return(s)
+                
+            return(self.lastlba)
+
+        for e in orderedEnd:
+            if not e+1 in start and (e+1) >= after:
+                if e+1<self.lastlba:
+                    return((e+1, _findNextStart(e+1)-1))
+                
+        return((None,None))
+ 
+    def _findSpace(self,size, after=None):
+        """Find space for a partition of size
+        
+        :param after: Find space starting after or on this sector
+        :param before: Find space on or before this sector
+        :param size: size in MiB
+        """
+        if after is None:
+            after=self.firstlba
+
+        bytesize=size*pow(2,20)
+        startsector,maxendsector=self._getNextFreeSectorBlock(after)
+
+        if startsector is None:
+            raise ValueError(f"Cant find space for a partition fo {size}MiB on {self.disk}")
+
+        lengthInSectors=bytesize//self.bytessector + bool(bytesize%self.bytessector)
+
+        # Align sectors to physical block
+        startsector=self.disk.alignStartSector(startsector)
+        endsector=startsector+lengthInSectors-1
+
+        if endsector > maxendsector:
+            return(self._findSpace(size,after=maxendsector))
+
+        return(startsector, endsector)
+
+    def getPartitionBy(self,idvalue,identifier='partuuid'):
+        for p in self._partitions:
+            if getattr(p,identifier)==idvalue:
+                return p
+        return(None)
+
+    def rmPartition(self,partition:'Partition'):
+        bash(f'sudo parted {self.disk.device} rm {partition.partnbr}')
+        self._updatePartitionTableData()
+
+    def addPartition(self, size, partitionlabel, keep=False,fslabel=None,fstype='', partitionflag=[]):
+        """Add a partition of given size in MiB to partition table
+        
+        Where a partition for the given label exists, and is the same size, its uuid
+        will be returned when its filesystem is the same as fstype or if fstype is blank.
+        Where the partition size differs, the partition with the given partition label
+        will be deleted and recreated at the appropriate size.
+
+        :param: keep - when True, if the partition with given label exists keep it
+        :return: uuid of existing or created partition
+        """
+        if not self.disk.confirmedAsExpectedDisk:
+            self.disk.confirmExpectedDisk()
+        
+        existingPartition=self.getPartitionBy(partitionlabel, 'partlabel')
+        if not existingPartition is None:
+            if existingPartition.mibsize == size and keep:
+                if fstype=='' or fstype==existingPartition.fstype:
+                    return(existingPartition.partuuid)
+            # Replacing 
+            self.rmPartition(existingPartition)
+            existingPartition=None
+            
+        currentDevices=set(self._listDevices())
+        startsector,endsector=self._findSpace(size)
+        bash(f'sudo parted {self.disk.device} mkpart {partitionlabel} {fstype} {startsector}s {endsector}s')
+       
+        self._updatePartitionTableData()
+        newDevice=set(self._listDevices())-currentDevices
+        print(f'Making partition {partitionlabel} on {self.disk.device}')
+        if(len(newDevice))==0:
+            raise OSError(f'Partition {partitionlabel} could not be created on {self.disk.device}')
+
+        newDevice=Path(newDevice.pop())
+
+        newPartition=self.getPartitionBy(newDevice,'device')
+
+        for flag in partitionflag:
+            bash(f'sudo parted {self.disk.device} set {newPartition.partnbr} {flag} on')
+
+        print('Partition table written. Checking alignment')
+        print(bash(f'sudo parted {self.disk.device} align-check optimal {newPartition.partnbr}').stdout)
+        
+        newPartition.mkfs(fstype, fslabel)
+        return(newPartition.partuuid)
+
+class Partition:
+    
+    PARTED_PARTTYPE_EXT4='8300'
+    PARTED_PARTTYPE_BIOSBOOT='ef02'
+
+    MKFS_FSTYPE=['ext4'] #mkfs for all these partitions
+    DEFAULT_FSTYPE='ext4'
+    
+    class Mountpoint:
+
+        SYSTEM_MOUNTS = '/proc/mounts'
+
+        def __init__(self, partition):
+            """
+            :sideeffect: Creates tempdir and mounts parititon there if not 
+                already mounted. This will be cleaned up on object.__del__()
+            """
+
+            #Check false for if grep finds nothing
+            mountsline=bash(f'cat {Partition.Mountpoint.SYSTEM_MOUNTS} | grep {partition.device}',check=False)
+
+            if mountsline.returncode == 0:
+                mountinfo=mountsline.stdout.split()
+                self.mountpoint=Path(mountinfo[1])
+                self.mountoptions=mountinfo[3]
+            else:
+                self.tempmount=Path(tempfile.mkdtemp())
+                self.mountpoint=self.tempmount
+                bash(f'sudo mount {partition.device} {self.mountpoint}')
+                
+        def __str__(self):
+            return(str(self.mountpoint))
+
+        def __del__(self):
+            '''Unmounts and deletes any temporary mountpoint that exists for ptn'''
+            if hasattr(self,'mountpoint'):
+                bash(f'sudo umount {self.mountpoint}')
+                bash(f'rmdir {self.mountpoint}')
+        
+    def __str__(self):
+        return(f'{self.mountpoint} {self.partlabel} {self.fstype} {self.mountpoint} {self.mibsize}[MiB]')
+
+    def __init__(self, table:PartitionTable, idvalue:str):
+        """Build partition from dictionary or a device path 
+
+        :param table: On which partition is located
+        :param uuid|devicepath: Identifies partition this object represents
+        :seealso: PartitionTable::_updatePartitionTableData._collatePartitionData
+        """
+        self.table=table
+        self.doonmkfs=[]
+        self.mountpoint = None
+        for k,v in self.table.partitiondata[idvalue].items():
+            setattr(self,k,v)
+        self.bytesize=self.sectorcount*self.table.bytessector
+        self.mibsize= self.bytesize / pow(2,20)
+
+    def mkfs(self,typevalue,label):
+        """Format partition filesystem and run pending callbacks
+        :note: Only fs types in Disk.Partition.MKFS_FSTYPE will be
+            prepared
+        """
+        if typevalue in Partition.MKFS_FSTYPE:
+            self.fslabel=label
+            print(f'Building {typevalue} filesystem on {self.device}')
+            bash(f'sudo mkfs -t {typevalue} -L {self.fslabel} {self.device}')
+            for f in self.doonmkfs:
+                f()
+        
+    def onmkfs(self, fn):
+        """Adds a callback to be run once the filesystem has been prepared
+        """
+        self.doonmkfs.append(fn)
+
+    def getMountpoint(self):
+        if not self.mountpoint is None:
+            return(self.mountpoint)
+
+        self.mountpoint=Partition.Mountpoint(self)
+        return(self.getMountpoint())
+
 
 class Disk:
     '''Concerned with initializing a disk
     
     initializing: Partitioning and formatting partitions with a filesystem.
     '''
-    SYSTEM_MOUNTS = '/proc/mounts'
     ALIGNMENT_OFFSET=1  #In Mb. Align partition to physical block
+    BOOT_FLAG='boot'
 
-    #--getsz returns in units of sector. This is the size of a sector in bytes
-    # See $> man blcokdev, /--getsz
-    BLKDEV_GETSZ_SECTORSZ=512 
+    def __str__(self):
+        return(f'{self.device} {self.GiBcount}[GiB]')
 
-    class Partition:
+    def __init__(self, devicepath):
         
-        PARTED_PARTTYPE_EXT4='8300'
-        PARTED_PARTTYPE_BIOSBOOT='ef02'
- 
-        MKFS_FSTYPE=['ext4'] #mkfs for all these partitions
-
-        def _data(self):
-            _data=dd(lambda:'')
-
-            for k,v in self.__dict__.items():
-                if not callable(v):
-                    dd[k]=v
-            return(_data)
-
-        def __del__(self):
-            '''Unmounts and deletes any temporary mountpoint that exists for ptn'''
-            if self.tempmount is not None:
-                bash(f'sudo umount {self.tempmount}')
-                bash(f'rmdir {self.tempmount}')
-
-
-        def __init__(self,disk,specifier):
-            '''Build partition from dictionary or a device path '''
-
-            # Partition info
-            self.partitionnbr=None
-            self.partitiontype=None      #This is the parted's internal code
-            self.startsector=None
-            self.endsector=None
-            self.partitionsectors=None
-
-            # Block info
-            self.partitionlabel=None
-            self.partitionuuid=None
-
-            self.fsblocksize=None
-            self.fslabel=None
-            self.fsuuid=None
-            self.fstype=None
-
-            self.device=None
-            self.mountpoint=None
-            self.mountoptions=None
-            self.tempmount=None
-
-            self.disk=disk
-            self.inpartitiontable=False
-            
-            
-            self.doonmkfs=[]
-
-            if isinstance(specifier,str):
-                self.device=specifier
-                self._initFromDevicePath()
-            else:
-                self._initFromDictionary()
-
-        def _initFromDevicePath(self):
-
-            mountsline=bash(f'cat {Disk.SYSTEM_MOUNTS} | grep {self.device}',False).stdout
-            try:
-                if mountsline.returncode == 0:
-                    mountinfo=mountsline.split()
-                    self.mountpoint=mountinfo[2]
-                    self.fstype=mountinfo[3]
-                    self.mountoptions=mountinfo[4]
-            except OSError: 
-                print('Device {} not mounted'.format(self.device))
-
-            blkid=getDictionaryFromKeyValueString(bash('sudo blkid -o export {}' % self.device).stdout)
-
-            self.partitionlabel=blkid['PARTLABEL']
-            self.partitionuuid=blkid['PARTUUID']
-
-            self.fslabel=blkid['LABEL']
-            self.fsuuid=blkid['UUID']
-            self.fstype=blkid['TYPE']
-            self.fsblocksize=blkid['BLOCK_SIZE']
-            self._setPartitionInfo()
-            self.inpartitiontable=True
-        
-        def _setPartitionInfo(self):
-            ''' Get partition info identified by start and end sector, or device path'''
-            if self.device is not None:
-                partitioninfo=map(
-                        lambda x:x.rstrip(';'),
-                        filter(
-                            lambda x:re.match('[0-9]',x) is not None,
-                            bash('sudo parted -m {} unit s print' % self.device)
-                                .stdout
-                                .splitlines()
-                            )
-                        ).pop().split(':')
-
-
-            elif self.startsector is not None and self.endsector is not None:
-                partitioninfo=filter(
-                    lambda x:re.match('.*{}s:{}s'.format(self.startsector,self.endsector), x),
-                    map(
-                        lambda x:x.rstrip(';'),
-                        filter(
-                            lambda x:re.match('[0-9]',x) is not None,
-                            bash('sudo parted -m {} unit s print' % self.device).stdout.splitlines()
-                            )
-                        )
-                    ).pop().split(':') # Only one entry in the array, this pttn
-
-            else:
-                # Partition needs start and end sector defined or else it must exist already
-                raise ValueError('Not correctly initialized')
- 
-            self.partitionnumber=partitioninfo[0]
-            self.startsector=partitioninfo[1].rtrim('s')
-            self.endsector=partitioninfo[2].rtrim('s')
-            self.partitionsectors=partitioninfo[3].rtrim('s')
-            self.partitiontype=partitioninfo[4]
-            self.partitionlabel=partitioninfo[5]
-            self.partitionflags=partitioninfo[6]
-
-        def getMountpoint(self):
-            '''Mounts partition if not mounted and returns the mountpoint
-            '''
-            if self.mountpoint is not None:
-                return(pathlib.Path(self.mountpoint))
-            else:
-                self.tempmount=tempfile.mkdtemp()
-                self.mountpoint=self.tempmount
-                bash(f'sudo mount {self.device} {self.mountpoint}')
-
-
-        def writeToPartitionTable(self):
-            '''Adds this partition to partition table'''
-
-            # CHECK THAT kwarg device is not overwritten
-            bash('sudo parted {device} mkpart {partitionlabel} {fstype} {startsector}s {endsector}s'.format(device=self.disk.device,**self.data()))
-
-            if self.partitiontype==Disk.Partition.PARTED_PARTTYPE_BIOSBOOT:
-                bash('sudo parted {device} set {partition} bios_grub on'
-                        .format(device=self.device,**self.data()))
-    
-            self._setPartitionInfo()
-            self.inpartitiontable=True
-
-        def mkfs(self):
-            if self.fstype in Disk.Partition.MKFS_FSTYPE:
-                bash(f'sudo mkfs -t {self.fstype} {self.device}')
-                
-            for f in self.doonmkfs:
-                f()
-            
-                
-            
-        def onmkfs(self, fn):
-            self.doonmkfs.append(fn)
-
-        def _initFromDictionary(self,d):
-            ''' Create a partition with parameters as per given dictionary 
-            The partition may not actually exist - until the partition table is written
-            
-            '''
-            for k in self.data():
-                if d.haskey(k):
-                    setattr(self,k,d[k])
-
-    def __init__(self, path):
-        
-        self.diskdata=json.loads(bash(f'sudo sfdisk -l -J {path}').stdout)
-
+        self.device=devicepath
+        self.partitiontable=PartitionTable(self)
         self.alignmentoffset=Disk.ALIGNMENT_OFFSET
-    
         self.confirmedAsExpectedDisk=False
-        self.ptchanged=False
-
-        self.pttype=self.diskdata['partitiontable']['label']
-        self.firstsector=self.diskdata['partitiontable']['firstlba']
-        self.lastsector=self.diskdata['partitiontable']['lastlba']
-        sectorcount=self.lastsector-self.firstsector - 1
-
-        self.bytessector=self.diskdata['partitiontable']['sectorsize']# nbr of bytes per physical sector
-
-        self.device=path
-        self._partitions=[Disk.Partition(self,x) for x in self._listDevices()]
-
-        blkid=getDictionaryFromKeyValueString(bash('sudo blkid -o export {}'.path).stdout)
-        self.ptuuid=blkid['PTUUID']
-        self.pttype=blkid['PTTYPE']
-        self.space=int(bash('sudo blkdev --getsz {}' % path).stdout)*Disk.BLKDEV_GETSZ_SECTORSZ
-
-        blkdev_bytessector=int(bash('sudo blkdev --getss {}' % path).stdout)
-        if(blkdev_bytessector!=self.bytessector):
-            raise ValueError(f'blkdev --getsz {self.device} and fdisk -l {self.device} disagree.'+
-                             f'blkdev {blkdev_bytessector}\nsfdisk {self.bytessector}')
-                
-        self.sectorcount=self.space%self.bytesPerSector
-        if(self.sectorcount != sectorcount):
-            raise ValueError(f'blkdev ({self.sectorcount}) and sfdisk ({sectorcount}) disagree on sectorcount')
-        
-    def _listDevices(self):
-        '''List all block devices for this disk''' 
-        devices=bash(f'sudo sfdisk -qlo device {self.device}').stdout.splitlines()
-        devices=[x for x in devices if re.match(r'/',x)] # remove heading
-        return(devices)
-
-    def _getNextFreeSector(self):
-        endsectors=[x.endsector for x in self._partitions]
-        if len(endsectors)==0:
-            return(self.alignmentoffset*pow(2,20))
-        return(max([x.endsector]))
-        
-        
-    def addPartition(self, size, partitionlabel, fslabel):
-        ''' Add a partition of given size in MB to partition table'''
-        bytesize=size*pow(2,20)
-        startsector=self._getNextFreeSector()
-        _data={
-            'startsector':startsector,
-            'endsector':startsector+bytesize,
-            'partitiontype':Disk.Partition.PARTED_PARTTYPE_BIOSBOOT, # linux partition type for gdisk
-            'fstype':'ext4',
-            'partitionlabel':partitionlabel,
-            'fslabel':fslabel,
-            }
-        self._partitions.append(Disk.Parition(_data))
-        self.ptchanged=True
-
+        self.bytecount=int(bash(f'sudo blockdev --getsize64 {self.device}').stdout)
+        self.GiBcount=int(self.bytecount/(pow(2,30)))
+        self.bytessector=int(bash(f'sudo blockdev --getpbsz {self.device}').stdout)
+        self.sectorcount=self.bytecount/self.bytessector
+       
     def _data(self):
         _data=dd(lambda:'')
-
         for k,v in self.__dict__.items():
             if not callable(v):
                 dd[k]=v
-
         return(_data)
 
-
-    def writePartitionTable(self):
-        ''' Write partition table consistent with partitions of disk. 
-        Return True if table written, else False
-        '''
-        if not self.confirmedAsExpectedDisk:
-            self.confirmExpectedDisk()
-        if not self.ptchanged:
-            return(False)
+    def alignStartSector(self,start):
+        """Given a sector to start with, make sure it is aligned on an alignment boundary
+        :return: Start adjusted upward to alignment boundary if not on one
+        """
+        sectorsPerBoundary = pow(2,20)/self.bytessector
+        if (start % sectorsPerBoundary)==0:
+            return(start)
         
-        bash('sudo parted {device} mklabel {pttype}' % self.data())
-        for p in self._partitions:
-            p.writeToPartitionTable()
-       
-        print('Partition table written. Checking alignment')
-        for p in self._partitions:
-            print(bash('sudo parted {} align-check optimal {}' % (self.device,p.partitionnbr)).stdout)
+        wholeSectorsToStart=start//sectorsPerBoundary
+        return((wholeSectorsToStart+1)*sectorsPerBoundary)
 
-        print('Partition table is now;')
-        print(bash(f'sudo parted {self.device} print').stdout)
-
-        self.ptchanged=False
-        
-    def mkfsOnPartitions(self):
-        for p in self._partitions:
-            p.mkfs()
-
-    def getPartitionByFsLabel(self,label):
-        for p in self._partitions:
-            if p.fslabel==label or p.partitionlabel==label:
-                return(p)
-        return(None)
-
-    def confirmExpectedDisk(self):
+    def confirmExpectedDisk(self): 
         print('Is this disk the right disk?')
-        print(bash('sudo sfdisk -l disk').stdout)
+        print(bash(f'sudo sfdisk -l {self.device}').stdout)
         userConfirm('Is this the right disk? Y|N')
+
         print('Disk has the following partitions, confirm each one')
-        for p in self._partitions:
-            print('{}:{}:{}'.format(p.device,p.fstype,p.mountpoint))
-            print('For this disk, is this an expected partition? Y|N')
-        print('Disk now cleared to be have its partition table rewritten.')
+        print(bash(f'sudo parted -l {self.device}').stdout)
+        #userConfirm('Are these the right partitions? Y|N')
+        print('Disk now cleared to be have its partition table modified.')
         self.confirmedAsExpectedDisk=True
-
-class GrubDisk(Disk):
-    '''Disk, which will have grub2 installed for bootloading
-    '''
-    GRUB_BOOT_SIZE=1
-    GRUB_DATA_SIZE=32
-   
-    GRUB_BOOT_PARTLABEL='grub_bios_boot'
-    GRUB_DATA_PARTLABEL='grub_data'
-    GRUB_DATA_FSLABEL='grub_data'
-    
-    def __init__(self, path):
-        '''Initialize disk so that partitions may be edited. 
-        
-        Attempts to make grub data partition in the next available area on disk. 
-        Assumes there is a 1Mibi block of free space at beginning of disk
-        '''
-
-        super().__init__(path)
-        
-        self.bootpartition=None
-        self.grubpartition=None
-        self.grubmenu=[]
-
-        self._initGrubBiosBoot()
-        self._initGrubDataPartition()
-        
-    
-    def _installGrub(self):
-        '''Installs grub to the grub data partition once its fs has been intialized
-        
-        This is invoked once a filesystem for this partition exists.
-        '''
-        # Mount data partition
-        
-        grubdatamount=tempfile.mkdtemp()
-        bash('sudo mount {} {}'.format(self.grubpartition.device,grubdatamount))
-        self.grubpartition.mountpoint=grubdatamount
-        self.grubpartition.tempmount=grubdatamount
-
-        # Install grub, specifying path to grub data partition
-        # NB: Grub will make this path relative to the filesystems root,
-        # see function grub_make_system_path_relative_to_its_root_os of grub source 
-        option='--boot-directory={}'.format(self.grubdatadir)
-
-        print("Installing grub to disk {}'s mbr, boot partition {} & grub data parttiion {}"
-                .format(self.device,self.bootpartition.device,self.grubpartition.device))
-
-        result = bash('sudo grub-install {} {}'.format(option, self.device))
-
-        print(result.stdout)
-        
-    def mkGrubMenuEntry(self, 
-                        name:str,
-                        partition:Disk.Partition,
-                        kernelpath:str,
-                        kernelarg:str):
-
-        entry='''
-            menuentry {} {{
-                search --set=root --label {}
-                linux {} {}
-            }}
-        '''.format(name,partition.fslabel,kernelpath,kernelarg)
-        
-        self.grubmenu.append(entry)
-        
-    def updateGrubMenu(self):
-        '''Updates the grub menu in grub_data'''
-        if self.grubdatadir is None:
-            raise ValueError('Both partition table needs to be written and fs inited todo this.')
-        else:
-            bash('sudo grub-mkconfig -o {}'.format(self.grubdatadir))
-
-    def _initGrubDataPartition(self,size=GRUB_DATA_SIZE):
-        ''' Install grub_data partition, format it.
-        
-        The installation of grub with $> grub install /dev/thisdisk will put all required
-        files here later
-        '''
-        
-        startsector=self._getNextFreeSector()
-        endsector=startsector+ ( (size*pow(2,20)) % self.bytessector ) - 1
-
-        grub_data={
-            'startsector':startsector,
-            'endsector':endsector,
-            'partitionlabel':GrubDisk.GRUB_DATA_PARTLABEL,
-            'partitiontype':Disk.Partition.PARTED_PARTTYPE_BIOSBOOT,
-            'fstype':'ext4',
-            'fslabel':GrubDisk.GRUB_DATA_FSLABEL,
-        }
-
-        self.grubpartition=Disk.Partition(grub_data)
-        self._partitions.append(self.grubpartition)
-        self.grubpartition.onmkfs(self._installGrub)
-        self.ptchanged=True
-
-            
-    def _initGrubBiosBootPartition(self,size=GRUB_BOOT_SIZE):
-        ''' Install grub_bios_boot partition
-        
-        This partition reserves space for the grub core.img to prevent a fs or os 
-        modifying it. ,
-        
-        Grub installs to 1 sector on disk, a list of addresses to load, which are
-        used to load grubs core.img. core.img will load device drivers that enable
-        access to the partition holding grub files. (grub_data)
-        
-        ASSUMES: 
-            *) The sector returned by self._getNextFreeSector() has enough space 
-            following it for this partition.
-            *) The sector returned by self._getNextFreeSector() is within the first
-            2[Gibi] - size[Mibi] of disk space
-        '''
-        boot_startsector=self._getNextFreeSector()
-
-        bytesize=size*pow(2,20)
-        nsector=bytesize%self.bytessector
-
-        boot_endsector=boot_startsector+nsector-1
-        
-        grub_boot={
-            'partitiontype':Disk.Partition.PARTED_PARTTYPE_BIOSBOOT, #gdisk bios boot type
-            'startsector':boot_startsector,
-            'endsector':boot_endsector,
-            'partitionlabel':GrubDisk.GRUB_BOOT_PARTLABEL,
-        }
-        
-        self.bootpartition=Disk.Partition(grub_boot)
-        self._partitions.append(self.bootpartition)
-        self.ptchanged=True
-        
